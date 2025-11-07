@@ -3,6 +3,7 @@ import os
 import argparse
 from collections import defaultdict
 from typing import Dict, List, Tuple
+import re
 
 # Comparison thresholds as requested: Pressure 1.0, Temperature 0.2, Humidity 5.0, U Winds 1.0, V Winds 1.0
 THRESHOLDS = {
@@ -34,12 +35,12 @@ def parse_frd_file(file_path: str) -> Dict[float, Dict[str, float]]:
             data_section_started = False
             for line in f:
                 line = line.strip()
-                
+
                 # Check for the start of the data section (line beginning with column names)
                 if line.startswith('IX'):
                     data_section_started = True
                     continue
-                
+
                 if data_section_started:
                     parts = line.split()
                     # Check for a data line (parts[0] is index, ensure enough columns exist)
@@ -47,7 +48,7 @@ def parse_frd_file(file_path: str) -> Dict[float, Dict[str, float]]:
                         try:
                             # Time is at index 1 and is the key for combining files
                             time_s = float(parts[1])
-                            
+
                             for label, index in COLUMNS_TO_EXTRACT.items():
                                 value = float(parts[index])
                                 # Only store if the value is not the invalid marker
@@ -66,16 +67,17 @@ def parse_frd_file(file_path: str) -> Dict[float, Dict[str, float]]:
         return {}
     return dict(data)
 
-def compare_data(data1: Dict[float, Dict[str, float]], 
-                 data2: Dict[float, Dict[str, float]], 
-                 parameter: str, 
-                 threshold: float) -> Tuple[int, float, float, float, float, int, float]:
+def compare_data(data1: Dict[float, Dict[str, float]],
+                 data2: Dict[float, Dict[str, float]],
+                 parameter: str,
+                 threshold: float) -> Tuple[int, float, float, float, float, int, float, List[float]]:
     """
-    Compares one parameter between two datasets (File 1 - File 2), 
+    Compares one parameter between two datasets (File 1 - File 2),
     calculates statistics, and checks against the threshold.
+    Returns diffs list as well for global aggregation.
     """
     diffs = []
-    
+
     # Identify all unique time steps present in both files for this comparison
     common_time_steps = sorted(set(data1.keys()) & set(data2.keys()))
 
@@ -83,7 +85,7 @@ def compare_data(data1: Dict[float, Dict[str, float]],
         # Safely retrieve data points
         val1 = data1[time_s].get(parameter)
         val2 = data2[time_s].get(parameter)
-            
+
         # Only compare if both values exist (were not -999.0)
         if val1 is not None and val2 is not None:
             # Calculation: File 1 (AVAPS) - File 2 (ACS)
@@ -92,28 +94,28 @@ def compare_data(data1: Dict[float, Dict[str, float]],
 
     if not diffs:
         # Return nan for statistics if no comparable values found
-        return 0, np.nan, np.nan, np.nan, np.nan, 0, 0.0
+        return 0, np.nan, np.nan, np.nan, np.nan, 0, 0.0, []
 
     diffs_array = np.array(diffs)
-    
+
     # Calculate statistics
     total_values = len(diffs_array)
     mean_diff = np.mean(diffs_array)
     min_diff = np.min(diffs_array)
     max_diff = np.max(diffs_array)
     std_dev = np.std(diffs_array)
-    
+
     # Count values within threshold (absolute difference <= threshold)
     within_threshold = np.sum(np.abs(diffs_array) <= threshold)
     percent_within = (within_threshold / total_values) * 100 if total_values > 0 else 0.0
 
-    return total_values, mean_diff, min_diff, max_diff, std_dev, within_threshold, percent_within
+    return total_values, mean_diff, min_diff, max_diff, std_dev, within_threshold, percent_within, diffs
 
-def format_output(param: str, stats: Tuple[int, float, float, float, float, int, float], 
-                  unit: str, threshold: float) -> str:
+def format_output(param: str, stats: Tuple[int, float, float, float, float, int, float],
+                  unit: str) -> str:
     """Formats the statistical output string to match the requested format."""
     total, mean, min_d, max_d, std, within, percent = stats
-    
+
     # Determine the label
     label_map = {
         'P': 'Pressure',
@@ -127,7 +129,7 @@ def format_output(param: str, stats: Tuple[int, float, float, float, float, int,
     # Handle the case of no comparable values
     if total == 0:
         return f"\nAVAPS - ACS {label} ({unit}):\n  No comparable data points found.\n"
-        
+
     # Format the output strings exactly as requested
     output = f"\nAVAPS - ACS {label}:\n"
     output += f"  Total values            : {total}\n"
@@ -135,63 +137,200 @@ def format_output(param: str, stats: Tuple[int, float, float, float, float, int,
     output += f"  Min/Max difference      : {min_d:.4f} / {max_d:.4f}\n"
     output += f"  Std dev                 : {std:.4f}\n"
     output += f"  Within threshold        : {within} ({percent:.2f}%)\n"
-    
+
     return output
+
+def extract_timestamp(filename: str) -> str:
+    """Extracts the timestamp (YYYYMMDD_HHMMSS) from the filename."""
+    # Regex for AVAPS file: DYYYYMMDD_HHMMSS_PQC.frd
+    avaps_match = re.search(r'D(\d{8}_\d{6})_PQC\.frd', filename)
+    if avaps_match:
+        return avaps_match.group(1)
+
+    # Regex for ACS file: HX_Melissa-YYYYMMDDH1-15-YYYYMMDDTHHMMSS-2QC.frd
+    # Extracting the YYYYMMDDTHHMMSS part
+    acs_match = re.search(r'-\d{8}T(\d{6})', filename)
+    if acs_match:
+        # For ACS, the date is in the first part of the filename
+        date_match = re.search(r'-(\d{8})H1', filename)
+        if date_match:
+             return f"{date_match.group(1)}_{acs_match.group(1)}"
+
+
+    return None
 
 def main():
     """Parses arguments and runs the file comparison."""
     parser = argparse.ArgumentParser(
-        description="Compares specified parameters between two .frd files (File 1 - File 2)."
+        description="Compares specified parameters between pairs of .frd files in a directory (File 1 - File 2)."
     )
     parser.add_argument(
-        "file1_path", 
-        type=str, 
-        help="Path to the first .frd file (AVAPS-like data)."
-    )
-    parser.add_argument(
-        "file2_path", 
-        type=str, 
-        help="Path to the second .frd file (ACS-like data)."
+        "directory_path",
+        type=str,
+        help="Path to the directory containing the .frd files."
     )
     args = parser.parse_args()
 
-    file1_path = args.file1_path
-    file2_path = args.file2_path
-    
-    print(f"Parsing File 1: {os.path.basename(file1_path)}")
-    data1 = parse_frd_file(file1_path)
-    print(f"Parsing File 2: {os.path.basename(file2_path)}")
-    data2 = parse_frd_file(file2_path)
-    
-    results = []
-    
-    # Check if files were successfully loaded
-    if not data1 or not data2:
-        print("\nComparison aborted due to file loading errors.")
+    directory_path = args.directory_path
+
+    if not os.path.isdir(directory_path):
+        print(f"Error: Directory not found: {directory_path}")
         return
 
-    # Map parameters to units for display
-    unit_map = {
-        'P': 'mb',
-        'T': 'C',
-        'RH': '%',
-        'U': 'm/s',
-        'V': 'm/s'
-    }
+    avaps_files = {}
+    acs_files = {}
 
-    # Compare each parameter
-    for param, threshold in THRESHOLDS.items():
-        stats = compare_data(data1, data2, param, threshold)
-        unit = unit_map.get(param, '')
-        results.append(format_output(param, stats, unit, threshold))
+    # Collect files and group by timestamp
+    for filename in os.listdir(directory_path):
+        if filename.endswith(".frd"):
+            file_path = os.path.join(directory_path, filename)
+            timestamp = extract_timestamp(filename)
+            if timestamp:
+                if filename.startswith('D'): # Assuming AVAPS files start with 'D'
+                    avaps_files[timestamp] = file_path
+                else: # Assuming ACS files do not start with 'D'
+                    acs_files[timestamp] = file_path
 
-    # Print results
-    print(f"\n{'='*20} Comparison Results {'='*20}")
-    print(f"Comparing: {os.path.basename(file1_path)} - {os.path.basename(file2_path)}")
-    print('-'*58)
-    for result in results:
-        print(result)
-    print('='*58)
+    # Find matching pairs based on timestamp, allowing for +/- 1 second difference
+    # Create a mapping from ACS timestamp to potential AVAPS timestamps
+    acs_timestamp_mapping = {}
+    for acs_ts in acs_files.keys():
+        try:
+            # Convert timestamp to integer seconds for comparison
+            date_part, time_part = acs_ts.split('_')
+            acs_time_in_seconds = int(time_part)
+            acs_timestamp_mapping[acs_ts] = []
+            # Look for AVAPS timestamps within +/- 1 second
+            for avaps_ts in avaps_files.keys():
+                avaps_date_part, avaps_time_part = avaps_ts.split('_')
+                if avaps_date_part == date_part:
+                    avaps_time_in_seconds = int(avaps_time_part)
+                    if abs(avaps_time_in_seconds - acs_time_in_seconds) <= 1:
+                        acs_timestamp_mapping[acs_ts].append(avaps_ts)
+        except (ValueError, IndexError):
+            print(f"Warning: Could not parse timestamp from ACS file: {acs_files[acs_ts]}")
+            continue
+
+    compared_pairs = set() # To avoid duplicate comparisons
+    global_diffs: Dict[str, List[float]] = defaultdict(list)
+    file_count = 0
+
+    # Iterate through the ACS timestamps and their potential AVAPS matches
+    for acs_ts, avaps_ts_list in acs_timestamp_mapping.items():
+        if acs_ts in acs_files and avaps_ts_list:
+            # Prioritize an exact match if available
+            exact_match_ts = None
+            for avaps_ts in avaps_ts_list:
+                if avaps_ts == acs_ts:
+                    exact_match_ts = avaps_ts
+                    break
+
+            if exact_match_ts:
+                avaps_ts_to_compare = exact_match_ts
+            else:
+                # If no exact match, pick the first one in the list (could be off by 1 second)
+                avaps_ts_to_compare = avaps_ts_list[0]
+
+
+            if avaps_ts_to_compare in avaps_files:
+                 file1_path = avaps_files[avaps_ts_to_compare]
+                 file2_path = acs_files[acs_ts]
+
+                 # Create a unique key for the pair regardless of order
+                 pair_key = tuple(sorted((file1_path, file2_path)))
+
+                 if pair_key not in compared_pairs:
+                    print(f"\nComparing pair based on timestamp {acs_ts}:")
+                    print(f"  File 1 (AVAPS): {os.path.basename(file1_path)}")
+                    print(f"  File 2 (ACS): {os.path.basename(file2_path)}")
+
+                    data1 = parse_frd_file(file1_path)
+                    data2 = parse_frd_file(file2_path)
+
+                    results = []
+
+                    # Check if files were successfully loaded
+                    if not data1 or not data2:
+                        print("Comparison aborted due to file loading errors.")
+                    else:
+                         file_count += 1
+                         # Map parameters to units for display
+                         unit_map = {
+                             'P': 'mb',
+                             'T': 'C',
+                             'RH': '%',
+                             'U': 'm/s',
+                             'V': 'm/s'
+                         }
+
+                         # Compare each parameter and accumulate global diffs
+                         for param, threshold in THRESHOLDS.items():
+                             stats = compare_data(data1, data2, param, threshold)
+                             unit = unit_map.get(param, '')
+                             results.append(format_output(param, stats[:7], unit)) # Pass only first 7 stats for formatting
+                             global_diffs[param].extend(stats[7]) # Extend global diffs with the list of diffs
+
+                         # Print results for the current pair
+                         print(f"\n{'='*20} Comparison Results {'='*20}")
+                         print(f"Comparing: {os.path.basename(file1_path)} - {os.path.basename(file2_path)}")
+                         print('-'*58)
+                         for result in results:
+                             print(result)
+                         print('='*58)
+
+                    compared_pairs.add(pair_key) # Mark this pair as compared
+            else:
+                 print(f"Warning: Could not find a matching AVAPS file for ACS timestamp {acs_ts}")
+
+    if not compared_pairs:
+        print("No matching file pairs found in the directory.")
+    else:
+        # Calculate and print global summary
+        print(f"\n\n=== GLOBAL SUMMARY ACROSS {file_count} FILE(S) ===")
+
+        unit_map = {
+            'P': 'mb',
+            'T': 'C',
+            'RH': '%',
+            'U': 'm/s',
+            'V': 'm/s'
+        }
+
+        for param, threshold in THRESHOLDS.items():
+            diffs = global_diffs[param]
+            if not diffs:
+                print(f"\nAVAPS - ACS {param}:")
+                print("  No comparable data points found globally.")
+                continue
+
+            global_diffs_array = np.array(diffs)
+
+            total_values = len(global_diffs_array)
+            mean_diff = np.mean(global_diffs_array)
+            min_diff = np.min(global_diffs_array)
+            max_diff = np.max(global_diffs_array)
+            std_dev = np.std(global_diffs_array)
+            within_threshold = np.sum(np.abs(global_diffs_array) <= threshold)
+            percent_within = (within_threshold / total_values) * 100 if total_values > 0 else 0.0
+
+            label_map = {
+                'P': 'Pressure',
+                'T': 'Temperature',
+                'RH': 'Humidity',
+                'U': 'U Winds',
+                'V': 'V Winds'
+            }
+            label = label_map.get(param, param)
+            unit = unit_map.get(param, '')
+
+
+            print(f"\nAVAPS - ACS {label}:")
+            print(f"  Total values        : {total_values}")
+            print(f"  Mean difference     : {mean_diff:.4f}")
+            print(f"  Min/Max difference  : {min_diff:.4f} / {max_diff:.4f}")
+            print(f"  Std dev             : {std_dev:.4f}")
+            print(f"  Within threshold    : {within_threshold} ({percent_within:.2f}%)")
+
 
 if __name__ == "__main__":
     main()

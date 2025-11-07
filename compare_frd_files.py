@@ -141,24 +141,24 @@ def format_output(param: str, stats: Tuple[int, float, float, float, float, int,
 
     return output
 
-def extract_timestamp(filename: str) -> str:
-    """Extracts the timestamp (YYYYMMDD_HHMMSS) from the filename."""
+def extract_timestamp(filename: str) -> Tuple[str, str]:
+    """
+    Extracts the timestamp (YYYYMMDD_HHMMSS) and file type ('AVAPS' or 'ACS')
+    from the filename. Returns (timestamp, file_type) or (None, None).
+    """
     # Regex for AVAPS file: DYYYYMMDD_HHMMSS_PQC.frd
     avaps_match = re.search(r'D(\d{8}_\d{6})_PQC\.frd', filename)
     if avaps_match:
-        return avaps_match.group(1)
+        return avaps_match.group(1), 'AVAPS'
 
-    # Regex for ACS file: HX_Melissa-YYYYMMDDH1-15-YYYYMMDDTHHMMSS-2QC.frd
-    # Extracting the YYYYMMDDTHHMMSS part
-    acs_match = re.search(r'-\d{8}T(\d{6})', filename)
+    # Regex for ACS file: Matches -YYYYMMDD[HIN][12] and then T HHMMSS
+    acs_match = re.search(r'-(\d{8})[HIN][12]-\d{2}-\d{8}T(\d{6})', filename)
     if acs_match:
-        # For ACS, the date is in the first part of the filename
-        date_match = re.search(r'-(\d{8})H1', filename)
-        if date_match:
-             return f"{date_match.group(1)}_{acs_match.group(1)}"
+        date_part = acs_match.group(1)
+        time_part = acs_match.group(2)
+        return f"{date_part}_{time_part}", 'ACS'
 
-
-    return None
+    return None, None
 
 def main():
     """Parses arguments and runs the file comparison."""
@@ -192,12 +192,27 @@ def main():
         for filename in os.listdir(directory_path):
             if filename.endswith(".frd"):
                 file_path = os.path.join(directory_path, filename)
-                timestamp = extract_timestamp(filename)
-                if timestamp:
-                    if filename.startswith('D'): # Assuming AVAPS files start with 'D'
-                        avaps_files[timestamp] = file_path
-                    else: # Assuming ACS files do not start with 'D'
-                        acs_files[timestamp] = file_path
+                ts_info, file_type = extract_timestamp(filename)
+                if ts_info and file_type:
+                    if file_type == 'AVAPS':
+                        avaps_files[ts_info] = file_path
+                    elif file_type == 'ACS':
+                        acs_files[ts_info] = file_path
+                else:
+                    print_to_file(f"Warning: Could not extract timestamp or determine file type for: {filename}")
+
+
+        # Print all extracted timestamps for debugging
+        print_to_file("=== Extracted Timestamps ===")
+        print_to_file("\nAVAPS Timestamps:")
+        for ts in sorted(avaps_files.keys()):
+            print_to_file(f"  {ts}: {os.path.basename(avaps_files[ts])}")
+
+        print_to_file("\nACS Timestamps:")
+        for ts in sorted(acs_files.keys()):
+            print_to_file(f"  {ts}: {os.path.basename(acs_files[ts])}")
+        print_to_file("============================")
+
 
         # Find matching pairs based on timestamp, allowing for +/- 1 second difference
         # Create a mapping from ACS timestamp to potential AVAPS timestamps
@@ -216,12 +231,13 @@ def main():
                         if abs(avaps_time_in_seconds - acs_time_in_seconds) <= 1:
                             acs_timestamp_mapping[acs_ts].append(avaps_ts)
             except (ValueError, IndexError):
-                print_to_file(f"Warning: Could not parse timestamp from ACS file: {acs_files[acs_ts]}")
+                print_to_file(f"Warning: Could not parse timestamp from ACS file: {os.path.basename(acs_files[acs_ts])} with timestamp {acs_ts}")
                 continue
 
         compared_pairs = set() # To avoid duplicate comparisons
         global_diffs: Dict[str, List[float]] = defaultdict(list)
         file_count = 0
+        low_threshold_pairs: List[Tuple[str, str, str, float]] = [] # To store file pairs with low within threshold
 
         # Iterate through the ACS timestamps and their potential AVAPS matches
         for acs_ts, avaps_ts_list in acs_timestamp_mapping.items():
@@ -257,6 +273,7 @@ def main():
                             data2 = parse_frd_file(file2_path)
 
                             results = []
+                            has_low_threshold = False
 
                             # Check if files were successfully loaded
                             if not data1 or not data2:
@@ -279,6 +296,12 @@ def main():
                                      results.append(format_output(param, stats[:7], unit)) # Pass only first 7 stats for formatting
                                      global_diffs[param].extend(stats[7]) # Extend global diffs with the list of diffs
 
+                                     # Check if within threshold is less than 99% for this parameter
+                                     if stats[6] < 99.0:
+                                         has_low_threshold = True
+                                         low_threshold_pairs.append((os.path.basename(file1_path), os.path.basename(file2_path), param, stats[6]))
+
+
                                  # Print results for the current pair to file
                                  print_to_file(f"\n{'='*20} Comparison Results {'='*20}")
                                  print_to_file(f"Comparing: {os.path.basename(file1_path)} - {os.path.basename(file2_path)}")
@@ -294,8 +317,18 @@ def main():
                     print_to_file(f"Warning: No potential AVAPS matches found for ACS file: {os.path.basename(acs_files[acs_ts])} with timestamp {acs_ts}")
 
 
+        # Print files with low within threshold
+        if low_threshold_pairs:
+            print_to_file("\n\n=== Files with Within Threshold < 99% ===")
+            for file1, file2, param, percent in low_threshold_pairs:
+                print_to_file(f"  {file1} vs {file2}: {param} ({percent:.2f}%)")
+            print_to_file("=======================================")
+        else:
+            print_to_file("\n\n=== All files have Within Threshold >= 99% ===")
+
+
         if not compared_pairs:
-            print_to_file("No matching file pairs found in the directory.")
+            print_to_file("\nNo matching file pairs found in the directory.")
         else:
             # Calculate and print global summary to file
             print_to_file(f"\n\n=== GLOBAL SUMMARY ACROSS {file_count} FILE(S) ===")
